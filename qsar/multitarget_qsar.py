@@ -5,13 +5,16 @@ from rdkit import Chem, RDLogger
 from rdkit.Chem import Draw
 from rdkit.Chem.MolStandardize import rdMolStandardize
 import io
+from pathlib import Path
 import base64
-
+import warnings
 from qsar.descriptors import calcular_descriptores
 
 RDLogger.DisableLog("rdApp.*")
 
-
+# ------------------------------------------------------------------
+# Clase MultiTargetQSAR
+# ------------------------------------------------------------------
 class MultiTargetQSAR:
     """
     Herramienta QSAR multiblanco para predicción binaria
@@ -27,9 +30,9 @@ class MultiTargetQSAR:
 
             Ejemplo:
             {
-                "AHR": "models/best_model_AHR_xgb_optuna.pkl",
-                "CAR": "models/best_model_CAR_xgb_optuna.pkl",
-                "PXR": "models/best_model_PXR_xgb_optuna.pkl"
+                "ahr": "models/best_model_ahr_xgb_optuna.pkl",
+                "car": "models/best_model_car_xgb_optuna.pkl",
+                "pxr": "models/best_model_pxr_xgb_optuna.pkl"
             }
         """
         self.models = {}
@@ -112,73 +115,177 @@ class MultiTargetQSAR:
             return [np.nan] * len(X_ext), ["AD Error"] * len(X_ext)
 
     # ------------------------------------------------------------------
+    # Normalizar input
+    # ------------------------------------------------------------------
+    def _load_input_data(self,input_data):
+        """
+        Acepta:
+        - lista de SMILES
+        - ruta a archivo CSV
+        - DataFrame
+        
+        Devuelve:
+        - DataFrame con columna 'SMILES'
+        """
+
+        # Caso 1: lista de SMILES
+        if isinstance(input_data, list):
+            df = pd.DataFrame({"SMILES": input_data})
+
+        # Caso 2: ruta a CSV
+        elif isinstance(input_data, (str, Path)):
+            input_data = Path(input_data)
+            if not input_data.exists():
+                raise FileNotFoundError(f"No se encontró el archivo: {input_data}")
+            
+            df = pd.read_csv(input_data)
+
+            if "SMILES" not in df.columns:
+                raise ValueError("El archivo CSV debe contener una columna llamada 'SMILES'")
+
+        # Caso 3: DataFrame
+        elif isinstance(input_data, pd.DataFrame):
+            if "SMILES" not in input_data.columns:
+                raise ValueError("El DataFrame debe contener una columna 'SMILES'")
+            df = input_data.copy()
+
+        else:
+            raise TypeError(
+                "input_data debe ser una lista de SMILES, un DataFrame o la ruta a un CSV"
+            )
+
+        # Limpieza básica
+        df = df.dropna(subset=["SMILES"])
+        df["SMILES"] = df["SMILES"].astype(str)
+
+        return df.reset_index(drop=True)
+
+
+    # ------------------------------------------------------------------
+    # Validación de smiles de entrada
+    # ------------------------------------------------------------------
+    def _validate_input_smiles(self, df):
+        """
+        Validación previa del input de SMILES.
+        Espera un DataFrame con columna 'SMILES'.
+        Emite warnings si hay SMILES inválidos.
+        """
+
+        if "SMILES" not in df.columns:
+            raise ValueError("El DataFrame debe contener una columna 'SMILES'")
+
+        invalid_rows = []
+        valid_rows = []
+
+        for idx, smi in enumerate(df["SMILES"]):
+
+            # No string
+            if not isinstance(smi, str):
+                invalid_rows.append(idx)
+                continue
+
+            # Heurística: posible concatenación accidental
+            if len(smi) > 300:
+                invalid_rows.append(idx)
+                continue
+
+            mol = Chem.MolFromSmiles(smi)
+            if mol is None:
+                invalid_rows.append(idx)
+            else:
+                valid_rows.append(idx)
+
+        df_valid = df.loc[valid_rows].reset_index(drop=True)
+        df_invalid = df.loc[invalid_rows].reset_index(drop=True)
+
+        report = {
+            "input_smiles": len(df),
+            "valid_smiles": len(df_valid),
+            "invalid_smiles": len(df_invalid)
+        }
+
+        if report["invalid_smiles"] > 0:
+            warnings.warn(
+                f"Input SMILES: {report['input_smiles']} | "
+                f"Válidos: {report['valid_smiles']} | "
+                f"Inválidos: {report['invalid_smiles']}",
+                UserWarning
+            )
+
+        return df_valid, df_invalid, report
+
+
+    # ------------------------------------------------------------------
     # Predicción principal
     # ------------------------------------------------------------------
-    def predict(self, smiles_list):
-        """
-        Realiza predicción multiblanco para una lista de SMILES
-        """
-        all_results = []
-        invalid_smiles = []
+    def predict(self, input_data):
 
-        for smiles in smiles_list:
-            # ---------- Parseo SMILES ----------
-            mol = Chem.MolFromSmiles(smiles)
-            if mol is None:
-                invalid_smiles.append(smiles)
-                continue
+      # Normalización de input
+      df = self._load_input_data(input_data)
 
-            mol = self._standardize_molecule(mol)
-            if mol is None:
-                invalid_smiles.append(smiles)
-                continue
+      # Validación SOLO para warning
+      df_valid, df_invalid, report = self._validate_input_smiles(df)
 
-            smiles_std = Chem.MolToSmiles(mol)
+      results = []
 
-            # ---------- Descriptores ----------
-            descriptors = calcular_descriptores(smiles_std)
-            if descriptors is None:
-                invalid_smiles.append(smiles)
-                continue
+      # Iterar sobre la columna SMILES
+      for smiles in df["SMILES"]:
 
-            X_raw = np.asarray(descriptors, dtype=float).reshape(1, -1)
-            mol_img = self._mol_to_base64(mol)
+          row = {
+              "SMILES": smiles,
+              "Valid_SMILES": True
+          }
 
-            # ---------- Predicción por blanco ----------
-            for target, obj in self.models.items():
-                clf = obj["model"]
-                le = obj["label_encoder"]
-                X_train = obj["X_train_preprocessed"]
+          # ---------- Parseo SMILES ----------
+          mol = Chem.MolFromSmiles(smiles)
+          if mol is None:
+              row["Valid_SMILES"] = False
+              results.append(row) 
+              continue
 
-                # Pipeline entrenado
-                Xp = clf.named_steps["clean"].transform(X_raw)
-                Xp = clf.named_steps["imputer"].transform(Xp)
-                Xp = clf.named_steps["scaler"].transform(Xp)
+          mol = self._standardize_molecule(mol)
+          if mol is None:
+              row["Valid_SMILES"] = False
+              results.append(row)
+              continue
 
-                # Predicción
-                class_index = list(le.classes_).index("Active")
-                proba_active = clf.predict_proba(Xp)[0, class_index]
+          smiles_std = Chem.MolToSmiles(mol)
+          row["Molecule_Image"] = self._mol_to_base64(mol)
 
-                pred_enc = clf.predict(Xp)[0]
-                pred_label = le.inverse_transform([pred_enc])[0]
+          # ---------- Descriptores ----------
+          descriptors = calcular_descriptores(smiles_std)
+          if descriptors is None:
+              row["Valid_SMILES"] = False
+              results.append(row)
+              continue
 
-                # Dominio de aplicabilidad
-                leverage, ad_flag = self._compute_leverage(Xp, X_train)
+          X_raw = np.asarray(descriptors, dtype=float).reshape(1, -1)
 
-                all_results.append({
-                    "SMILES": smiles,
-                    "Target": target,
-                    "Prediction": pred_label,
-                    "Probability": proba_active,
-                    "Leverage": leverage[0],
-                    "AD_Flag": ad_flag[0],
-                    "Molecule_Image": mol_img
-                })
+          # ---------- Predicción por target ----------
+          for target, obj in self.models.items():
+              clf = obj["model"]
+              le = obj["label_encoder"]
+              X_train = obj["X_train_preprocessed"]
 
-        results_df = pd.DataFrame(all_results)
+              Xp = clf.named_steps["clean"].transform(X_raw)
+              Xp = clf.named_steps["imputer"].transform(Xp)
+              Xp = clf.named_steps["scaler"].transform(Xp)
 
-        invalid_df = pd.DataFrame(
-            {"Invalid_SMILES": invalid_smiles}
-        )
+              class_index = list(le.classes_).index("Active")
+              proba_active = clf.predict_proba(Xp)[0, class_index]
 
-        return results_df, invalid_df
+              pred_enc = clf.predict(Xp)[0]
+              pred_label = le.inverse_transform([pred_enc])[0]
+
+              leverage, ad_flag = self._compute_leverage(Xp, X_train)
+
+              row[f"{target}_Pred"] = pred_label
+              row[f"{target}_Prob"] = proba_active
+              row[f"{target}_Leverage"] = leverage[0]
+              row[f"{target}_AD"] = ad_flag[0]
+
+          results.append(row)
+
+      final_df = pd.DataFrame(results)
+
+      return final_df
