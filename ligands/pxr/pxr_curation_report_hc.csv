@@ -1,0 +1,8 @@
+Step,Description,Entries_before,Entries_after,Removed,Removed_%
+1,Active / inactive filtering,9667,6413,3254,33.66
+2,SMILES parsing,6413,6315,98,1.53
+3,Filtering non-organic molecules,6315,6226,89,1.41
+4,Structural standardization,6226,6226,0,0.0
+5,Canonical SMILES generation,6226,6226,0,0.0
+6,Deduplication by standardized SMILES,6226,4998,1228,19.72
+7,Summary,9667,4998,4669,48.3
